@@ -82,9 +82,244 @@ generate_dnsmasq_entry() {
 	fi
 }
 
+STATE_FILE="/var/run/timecontrol.state"
+
 iptables_w() {
 	iptables -w 1 "$@" >/dev/null 2>&1
 	[ -n "$FW3_IP6" ] && ip6tables -w 1 "$@" >/dev/null 2>&1
+}
+
+# --- Accumulation Logic ---
+
+init_accumulation_chains() {
+	if [ -z "$FW4" ]; then
+		# Create monitoring chain
+		for table in filter; do
+			for ipt in iptables ip6tables; do
+				[ "$ipt" = "ip6tables" ] && [ -z "$FW3_IP6" ] && continue
+				
+				# Create timecontrol_check chain if not exists
+				if ! $ipt -w 1 -t $table -L timecontrol_check >/dev/null 2>&1; then
+					$ipt -w 1 -t $table -N timecontrol_check
+				fi
+				$ipt -w 1 -t $table -F timecontrol_check
+				
+				# Insert check chain at the beginning of FORWARD
+				if ! $ipt -w 1 -t $table -C FORWARD -j timecontrol_check >/dev/null 2>&1; then
+					$ipt -w 1 -t $table -I FORWARD 1 -j timecontrol_check
+				fi
+			done
+		done
+	else
+		# FW4/NFT
+		if ! nft list chain inet fw4 timecontrol_check >/dev/null 2>&1; then
+			nft add chain inet fw4 timecontrol_check
+		fi
+		nft flush chain inet fw4 timecontrol_check
+		
+		# Insert check chain at the beginning of forward hook
+		# We need to find the priority. Usually filter forward is 0. 
+		# We want this to run before reject.
+		# For simplicity, we can insert a jump rule in the 'forward' chain created by fw4
+		if ! nft list chain inet fw4 forward | grep -q "jump timecontrol_check"; then
+			nft insert rule inet fw4 forward counter jump timecontrol_check comment "!fw4: Time control check"
+		fi
+	fi
+}
+
+get_current_usage() {
+	local id="$1"
+	# Read from state file (simple key-value: ID=MINUTES)
+	if [ -f "$STATE_FILE" ]; then
+		grep "^$id=" "$STATE_FILE" | cut -d'=' -f2
+	else
+		echo "0"
+	fi
+}
+
+set_usage() {
+	local id="$1"
+	local usage="$2"
+	local today=$(date +%Y-%m-%d)
+	
+	# Create temp file
+	local tmp_file="${STATE_FILE}.tmp"
+	touch "$tmp_file"
+	
+	# If state file exists, check for date reset
+	if [ -f "$STATE_FILE" ]; then
+		local file_date=$(date -r "$STATE_FILE" +%Y-%m-%d)
+		if [ "$today" != "$file_date" ]; then
+			# New day, reset all usages (just start empty)
+			: > "$tmp_file"
+		else
+			grep -v "^$id=" "$STATE_FILE" > "$tmp_file"
+		fi
+	fi
+	
+	echo "$id=$usage" >> "$tmp_file"
+	mv "$tmp_file" "$STATE_FILE"
+}
+
+check_in_window() {
+	local timerangelist="$1"
+	local weekdays="$2"
+	
+	# Check Weekday
+	if [ -n "$weekdays" ]; then
+		local current_day=$(date +%A)
+		if ! echo "$weekdays" | grep -q "$current_day"; then
+			return 1 # Not in allowed day
+		fi
+	fi
+	
+	# Check Time Range
+	if [ -z "$timerangelist" ]; then
+		return 0 # No time limit means always allowed
+	fi
+	
+	local current_time=$(date +%H%M)
+	local in_range=1 # Default false (1)
+	
+	for timerange in $timerangelist; do
+		local start=$(echo "$timerange" | awk -F '-' '{print $1}' | tr -d :)
+		local end=$(echo "$timerange" | awk -F '-' '{print $2}' | tr -d :)
+		# Handle hh:mm:ss -> hhmm
+		start=${start:0:4}
+		end=${end:0:4}
+		
+		if [ "$current_time" -ge "$start" ] && [ "$current_time" -le "$end" ]; then
+			in_range=0 # True
+			break
+		fi
+	done
+	
+	return $in_range
+}
+
+get_packet_count() {
+	local id="$1"
+	local mac="$2"
+	local domain_set_v4="$3"
+	
+	# We use a unique comment/handle to find the rule
+	# comment: "tc_monitor_$id"
+	
+	if [ -z "$FW4" ]; then
+		# iptables: find rule in timecontrol_check with comment
+		# We sum up packets from all rules for this ID (v4/v6/mac/ipset)
+		iptables -w 1 -t filter -L timecontrol_check -v -n -x | grep "tc_monitor_$id" | awk '{s+=$1} END {print s}'
+	else
+		# nftables: find rule in timecontrol_check with comment
+		nft list chain inet fw4 timecontrol_check | grep "tc_monitor_$id" | awk '{print $2}' | tr -d ' ' | paste -sd+ | bc
+	fi
+}
+
+update_accumulation() {
+	config_foreach check_accumulation_rule rule
+}
+
+check_accumulation_rule() {
+	local section="$1"
+	local enable=$(config_n_get "$CONF" "$section" "enable" 0)
+	local mode=$(config_n_get "$CONF" "$section" "mode" "basic")
+	local limit=$(config_n_get "$CONF" "$section" "limit_time" 60)
+	local timerangelist=$(config_n_get "$CONF" "$section" "timerangelist")
+	local weekdays=$(config_n_get "$CONF" "$section" "weekdays")
+	local macaddrlist=$(config_n_get "$CONF" "$section" "macaddrlist")
+	local enable_domain=$(config_n_get "$CONF" "$section" "enable_domain" 0)
+	local domain_set_v4=""
+	local domain_set_v6=""
+	
+	[ "$enable" -eq 1 ] && [ "$mode" = "accumulation" ] || return 0
+	
+	if [ "$enable_domain" -eq 1 ]; then
+		domain_set_v4="tc_v4_$section"
+		domain_set_v6="tc_v6_$section"
+	fi
+
+	# 1. Update Usage
+	# Read previous packet count (stored in memory? no, we only have total packets since start)
+	# Wait, we need "delta". But if we don't restart firewall, the counter increases.
+	# We can store "last_packets" in a file too.
+	
+	local current_packets=$(get_packet_count "$section" "$macaddrlist" "$domain_set_v4")
+	[ -z "$current_packets" ] && current_packets=0
+	
+	local last_packets_file="/tmp/timecontrol_${section}.pkts"
+	local last_packets=0
+	if [ -f "$last_packets_file" ]; then
+		last_packets=$(cat "$last_packets_file")
+	fi
+	echo "$current_packets" > "$last_packets_file"
+	
+	# Calculate delta (handle restart where current < last)
+	local delta=0
+	if [ "$current_packets" -ge "$last_packets" ]; then
+		delta=$((current_packets - last_packets))
+	else
+		delta="$current_packets"
+	fi
+	
+	# If significant traffic (e.g. > 100 packets/min ~ 10KB), increment usage
+	local current_usage=$(get_current_usage "$section")
+	if [ "$delta" -gt 100 ]; then
+		current_usage=$((current_usage + 1))
+		set_usage "$section" "$current_usage"
+	fi
+	
+	# 2. Check Logic (In Window AND Under Limit)
+	local block_needed=0
+	
+	check_in_window "$timerangelist" "$weekdays"
+	local in_window=$?
+	
+	if [ "$in_window" -ne 0 ]; then
+		block_needed=1 # Outside Allowed Window -> Block
+	elif [ "$current_usage" -ge "$limit" ]; then
+		block_needed=1 # Over Limit -> Block
+	fi
+	
+	# 3. Enforce State (Add/Remove Block Rule)
+	# We use the standard set_Rules function but dynamically
+	# We construct a unique comment for the block rule to identify it: "tc_block_$section"
+	
+	local rule_exists=0
+	if [ -z "$FW4" ]; then
+		if iptables -w 1 -t filter -C timecontrol_forward_reject -m comment --comment "tc_block_$section" -j REJECT 2>/dev/null; then
+			rule_exists=1
+		fi
+	else
+		if nft list chain inet fw4 timecontrol_forward_reject | grep -q "tc_block_$section"; then
+			rule_exists=1
+		fi
+	fi
+	
+	if [ "$block_needed" -eq 1 ]; then
+		if [ "$rule_exists" -eq 0 ]; then
+			# Add Block Rule
+			set_Rules "$macaddrlist" "" "" "$interface" "${CONF}_maclist_$section" 1 "$section" "$domain_set_v4" "$domain_set_v6" "tc_block_$section"
+		fi
+	else
+		if [ "$rule_exists" -eq 1 ]; then
+			# Remove Block Rule
+			# We need to delete by comment.
+			if [ -z "$FW4" ]; then
+				# iptables delete by rule spec is hard if we don't have exact spec.
+				# But set_Rules creates predictable rules.
+				# Easier: Flush and rebuild? No.
+				# Delete using loop until fail
+				while iptables -w 1 -t filter -D timecontrol_forward_reject -m comment --comment "tc_block_$section" -j REJECT 2>/dev/null; do :; done
+				[ -n "$FW3_IP6" ] && while ip6tables -w 1 -t filter -D timecontrol_forward_reject -m comment --comment "tc_block_$section" -j REJECT 2>/dev/null; do :; done
+			else
+				# nft delete by handle. Find handle by comment.
+				handles=$(nft -a list chain inet fw4 timecontrol_forward_reject | grep "tc_block_$section" | awk '{print $NF}')
+				for handle in $handles; do
+					nft delete rule inet fw4 timecontrol_forward_reject handle $handle 2>/dev/null
+				done
+			fi
+		fi
+	fi
 }
 
 config_n_get() {
@@ -138,6 +373,17 @@ set_Rules() {
 	local ipsetname=$5
 	local matchflag=$6 # 0: not match, 1: match
 	local id=$7
+	local domain_set_v4=$8
+	local domain_set_v6=$9
+	local comment_tag=${10} # Optional comment override
+
+	if [ -z "$comment_tag" ]; then
+		comment_tag="!fw3: Time control"
+		# For nft, it was "!fw4: Time control"
+		if [ -n "$FW4" ]; then
+			comment_tag="!fw4: Time control"
+		fi
+	fi
 
 	if [ -z "$FW4" ]; then
 		local ether_saddr_param
@@ -157,6 +403,11 @@ set_Rules() {
 		if [ -n "$days" ]; then
 			weekdays_param="--weekdays "$days""
 		fi
+
+		# If timerangelist is empty, and we are not in accumulation mode call (which passes empty ranges for block rule),
+		# then default to all day.
+		# But here, if timerangelist is empty, loop below runs once with empty string, setting empty time_param.
+		# This is correct.
 
 		if [ -z "$timerangelist" ]; then
 			timerangelist="00:00:00-23:59:59"
@@ -184,13 +435,23 @@ set_Rules() {
 					;;
 				*) ;;
 				esac
+				
+				local dst_v4_param=""
+				local dst_v6_param=""
+				if [ -n "$domain_set_v4" ]; then
+					dst_v4_param="-m set --match-set $domain_set_v4 dst"
+					dst_v6_param="-m set --match-set $domain_set_v6 dst"
+				fi
+
 				if [ -n "$interfacelist" ]; then
 					for interface in $interfacelist; do
 						iifname_param="-i ${interface}"
-						iptables_w -t $table -A $chain $iifname_param $ether_saddr_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "!fw3: Time control"
+						iptables -w 1 -t $table -A $chain $iifname_param $ether_saddr_param $dst_v4_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "$comment_tag"
+						[ -n "$FW3_IP6" ] && ip6tables -w 1 -t $table -A $chain $iifname_param $ether_saddr_param $dst_v6_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "$comment_tag"
 					done
 				else
-					iptables_w -t $table -A $chain $ether_saddr_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "!fw3: Time control"
+					iptables -w 1 -t $table -A $chain $ether_saddr_param $dst_v4_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "$comment_tag"
+					[ -n "$FW3_IP6" ] && ip6tables -w 1 -t $table -A $chain $ether_saddr_param $dst_v6_param -m time --kerneltz $time_param $weekdays_param -j $target -m comment --comment "$comment_tag"
 				fi
 			done
 		done
@@ -229,9 +490,19 @@ set_Rules() {
 			local interface=\"$(echo $interfacelist | sed 's/ /","/g')\"
 			iifname_param="iifname { ${interface} } "
 		fi
-
-		TZ=UTC nft "add rule inet fw4 timecontrol_forward_reject ${ether_saddr_param} ${meta_hour_param} ${meta_day_param} ${iifname_param} counter jump handle_reject comment \"!fw4: Time control\""
-		TZ=UTC nft "add rule inet fw4 timecontrol_dstnat_accept ${ether_saddr_param} ${meta_hour_param} ${meta_day_param} ${iifname_param} counter accept comment \"!fw4: Time control\""
+		
+		if [ -n "$domain_set_v4" ]; then
+			# Domain restriction enabled: specific rules for v4 and v6
+			TZ=UTC nft "add rule inet fw4 timecontrol_forward_reject ${ether_saddr_param} ip daddr @$domain_set_v4 ${meta_hour_param} ${meta_day_param} ${iifname_param} counter jump handle_reject comment \"$comment_tag\""
+			TZ=UTC nft "add rule inet fw4 timecontrol_forward_reject ${ether_saddr_param} ip6 daddr @$domain_set_v6 ${meta_hour_param} ${meta_day_param} ${iifname_param} counter jump handle_reject comment \"$comment_tag\""
+			
+			TZ=UTC nft "add rule inet fw4 timecontrol_dstnat_accept ${ether_saddr_param} ip daddr @$domain_set_v4 ${meta_hour_param} ${meta_day_param} ${iifname_param} counter accept comment \"$comment_tag\""
+			TZ=UTC nft "add rule inet fw4 timecontrol_dstnat_accept ${ether_saddr_param} ip6 daddr @$domain_set_v6 ${meta_hour_param} ${meta_day_param} ${iifname_param} counter accept comment \"$comment_tag\""
+		else
+			# Standard behavior
+			TZ=UTC nft "add rule inet fw4 timecontrol_forward_reject ${ether_saddr_param} ${meta_hour_param} ${meta_day_param} ${iifname_param} counter jump handle_reject comment \"$comment_tag\""
+			TZ=UTC nft "add rule inet fw4 timecontrol_dstnat_accept ${ether_saddr_param} ${meta_hour_param} ${meta_day_param} ${iifname_param} counter accept comment \"$comment_tag\""
+		fi
 	fi
 
 	local log_MAC="MAC: AllClients;"
@@ -295,6 +566,8 @@ add_controlRules() {
 	local temporaryControl=$(config_n_get "$CONF" "$1" "temporaryControl" 0)
 	local temporaryDuration=$(config_n_get "$CONF" "$1" "temporaryDuration" 0)
 	local interface=$(config_n_get "$CONF" "$1" "interface")
+	local enable_domain=$(config_n_get "$CONF" "$1" "enable_domain" 0)
+	local mode=$(config_n_get "$CONF" "$1" "mode" "basic")
 
 	if [ $enable -ne 1 ]; then
 		return 0
@@ -321,8 +594,15 @@ add_controlRules() {
 	fi
 
 	#blacklist with no time and day limit
-	if [ $TIMECONTROL_TYPE -ne 0 ] && [ -z "$timerangelist" ] && [ -z "$days" ] && [ $temporaryDuration -eq 0 ]; then
+	if [ $TIMECONTROL_TYPE -ne 0 ] && [ -z "$timerangelist" ] && [ -z "$days" ] && [ $temporaryDuration -eq 0 ] && [ "$mode" = "basic" ]; then
 		return 0
+	fi
+	
+	local domain_set_v4=""
+	local domain_set_v6=""
+	if [ "$enable_domain" -eq 1 ]; then
+		domain_set_v4="tc_v4_$1"
+		domain_set_v6="tc_v6_$1"
 	fi
 
 	#temporary block
@@ -331,8 +611,60 @@ add_controlRules() {
 		timerangelist="00:00:00-23:59:59"
 		logger -t timecontrol "temporary block $temporaryDuration minutes (ID: $1)"
 	fi
-
-	set_Rules "$macaddrlist" "$timerangelist" "$days" "$interface" "${CONF}_maclist_$1" 1 "$1"
+	
+	if [ "$mode" = "accumulation" ]; then
+		# In Accumulation Mode:
+		# 1. We don't add the standard Block Rule here (it's managed dynamically in the loop).
+		# 2. We DO add a "Monitor Rule" to the monitoring chain to count packets.
+		
+		# Create Monitor Rule (Accept/Return/Continue)
+		if [ -z "$FW4" ]; then
+			local ether_saddr_param
+			local dst_v4_param=""
+			local dst_v6_param=""
+			
+			# Create ipset if needed (usually done in set_Rules, but we need it here)
+			local ipsetname="${CONF}_maclist_$1"
+			if [ -n "$macaddrlist" ]; then
+				ipset create "$ipsetname" hash:mac -exist
+				for macaddr in $macaddrlist; do
+					ipset add "$ipsetname" $macaddr -exist
+				done
+				ether_saddr_param="-m set --match-set $ipsetname src"
+			fi
+			
+			if [ -n "$domain_set_v4" ]; then
+				dst_v4_param="-m set --match-set $domain_set_v4 dst"
+				dst_v6_param="-m set --match-set $domain_set_v6 dst"
+			fi
+			
+			# Add to check chain
+			iptables -w 1 -t filter -A timecontrol_check $ether_saddr_param $dst_v4_param -j RETURN -m comment --comment "tc_monitor_$1"
+			[ -n "$FW3_IP6" ] && ip6tables -w 1 -t filter -A timecontrol_check $ether_saddr_param $dst_v6_param -j RETURN -m comment --comment "tc_monitor_$1"
+			
+		else
+			# NFT Monitor Rule
+			local ether_saddr_param
+			if [ -n "$macaddrlist" ]; then
+				local macaddr=$(echo $macaddrlist | sed 's/ /,/g')
+				ether_saddr_param="ether saddr { ${macaddr} } "
+			fi
+			
+			if [ -n "$domain_set_v4" ]; then
+				nft add rule inet fw4 timecontrol_check ${ether_saddr_param} ip daddr @$domain_set_v4 counter return comment \"tc_monitor_$1\"
+				nft add rule inet fw4 timecontrol_check ${ether_saddr_param} ip6 daddr @$domain_set_v6 counter return comment \"tc_monitor_$1\"
+			else
+				nft add rule inet fw4 timecontrol_check ${ether_saddr_param} counter return comment \"tc_monitor_$1\"
+			fi
+		fi
+		
+		logger -t timecontrol "added monitor rule for accumulation (ID: $1)"
+		
+	else
+		# Basic Mode
+		set_Rules "$macaddrlist" "$timerangelist" "$days" "$interface" "${CONF}_maclist_$1" 1 "$1" "$domain_set_v4" "$domain_set_v6"
+	fi
+	
 	delete_conntrack "$macaddrlist" "$interface" 1
 }
 
@@ -389,6 +721,8 @@ Initialize() {
 			rm "$DNSMASQ_TMP"
 		fi
 	fi
+	
+	init_accumulation_chains
 
 	if [ -z "$FW4" ]; then
 		set_iptablesChains
@@ -592,6 +926,7 @@ start() {
 		done
 		SLEEPTIME=60
 		update_temporaryDuration
+		update_accumulation
 		check_firstRule
 	done
 }

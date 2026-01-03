@@ -747,6 +747,16 @@ return view.extend({
 
 		fwtool.addMACOption(s, 'general', 'macaddrlist', _('Client MAC'), null, hosts);
 
+		o = s.taboption('timed', form.ListValue, 'mode', _('Control Mode'));
+		o.default = 'basic';
+		o.value('basic', _('Basic (Block during time)'));
+		o.value('accumulation', _('Accumulation (Allow during time with limit)'));
+
+		o = s.taboption('timed', form.Value, 'limit_time', _('Daily Limit (Minutes)'), _('Maximum allowed time per day within the allowed time ranges'));
+		o.depends('mode', 'accumulation');
+		o.datatype = 'uinteger';
+		o.default = '60';
+
 		addWeekdayOption(s, 'timed', 'weekdays', _('Week Days'));
 
 		addTimeRangeOption(s, 'timed', 'timerangelist', _('Time Ranges'), _('Example') + ': ' + '00:00:00-10:00:00,11:00:00-13:59:59');
