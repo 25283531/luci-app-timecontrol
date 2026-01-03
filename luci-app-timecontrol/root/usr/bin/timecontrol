@@ -58,12 +58,24 @@ generate_dnsmasq_entry() {
 			if [ -z "$FW4" ]; then
 				local set_str="$set_v4,$set_v6"
 				for d in $domains; do
-					echo "ipset=/$d/$set_str" >> "$DNSMASQ_TMP"
+					if echo "$d" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+						ipset -q add "$set_v4" "$d"
+					elif echo "$d" | grep -q ":"; then
+						ipset -q add "$set_v6" "$d"
+					else
+						echo "ipset=/$d/$set_str" >> "$DNSMASQ_TMP"
+					fi
 				done
 			else
 				local set_str="4#inet#fw4#$set_v4,6#inet#fw4#$set_v6"
 				for d in $domains; do
-					echo "nftset=/$d/$set_str" >> "$DNSMASQ_TMP"
+					if echo "$d" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+						nft add element inet fw4 "$set_v4" \{ "$d" \} 2>/dev/null
+					elif echo "$d" | grep -q ":"; then
+						nft add element inet fw4 "$set_v6" \{ "$d" \} 2>/dev/null
+					else
+						echo "nftset=/$d/$set_str" >> "$DNSMASQ_TMP"
+					fi
 				done
 			fi
 		fi

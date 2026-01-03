@@ -624,6 +624,25 @@ return view.extend({
 			});
 		};
 
+		s = m.section(form.GridSection, 'domain_rule', _('Domain Restriction Rules'));
+		s.addremove = true;
+		s.anonymous = true;
+		s.sortable = true;
+		s.collapsible = true;
+
+		o = s.option(form.Value, 'name', _('Rule Name'));
+		o.validate = function (section_id, value) {
+			if (!value) return _('Name is required');
+			return true;
+		};
+
+		o = s.option(form.TextValue, 'domains', _('Domain/IP List'), _('One domain or IP per line. Wildcards supported for domains (e.g. google.com matches *.google.com)'));
+		o.rows = 5;
+		o.validate = function (section_id, value) {
+			if (!value) return _('At least one domain or IP is required');
+			return true;
+		};
+
 		s = m.section(form.GridSection, 'rule', _('Control Rules'));
 		s.addremove = true;
 		s.anonymous = true;
