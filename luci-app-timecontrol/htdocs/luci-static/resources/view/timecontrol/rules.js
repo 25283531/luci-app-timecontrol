@@ -707,6 +707,20 @@ return view.extend({
 			return this.super('write', [section_id, value.trim()]);
 		};
 
+		o = s.taboption('general', form.Flag, 'enable_domain', _('Enable Domain Restriction'), _('If enabled, only blocks matching domains; otherwise blocks all traffic'));
+		o.modalonly = true;
+		o.rmempty = false;
+
+		o = s.taboption('general', form.MultiValue, 'domain_rules', _('Select Domain Rules'));
+		o.modalonly = true;
+		o.depends('enable_domain', '1');
+		o.multiple = true;
+		
+		var domain_sections = uci.sections('timecontrol', 'domain_rule');
+		for (var i = 0; i < domain_sections.length; i++) {
+			o.value(domain_sections[i]['.name'], domain_sections[i]['name'] || _('Unnamed'));
+		}
+
 		o = s.taboption('general', widgets.DeviceSelect, 'interface', _('Interface'));
 		o.nocreate = true;
 		o.modalonly = true;

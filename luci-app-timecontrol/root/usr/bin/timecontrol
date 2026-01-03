@@ -10,6 +10,65 @@ FW3_IP6=$(command -v ip6tables 2>/dev/null)
 PIDFILE="/var/run/timecontrol.pid"
 SLEEPTIME=60
 RulesMACAddrList=""
+DNSMASQ_CONF="/tmp/dnsmasq.d/timecontrol.conf"
+DNSMASQ_TMP="/tmp/dnsmasq_timecontrol.new"
+
+get_domain_list() {
+	local rule_ids="$1"
+	local all_domains=""
+	for id in $rule_ids; do
+		local domains=$(uci -q get "${CONF}.${id}.domains")
+		domains=$(echo "$domains" | tr '\n' ' ')
+		all_domains="$all_domains $domains"
+	done
+	echo "$all_domains"
+}
+
+create_sets() {
+	local set_v4="$1"
+	local set_v6="$2"
+
+	if [ -z "$FW4" ]; then
+		ipset -n list "$set_v4" >/dev/null 2>&1 || ipset create "$set_v4" hash:ip family inet
+		ipset -n list "$set_v6" >/dev/null 2>&1 || ipset create "$set_v6" hash:ip family inet6
+		ipset flush "$set_v4"
+		ipset flush "$set_v6"
+	else
+		nft list set inet fw4 "$set_v4" >/dev/null 2>&1 || nft add set inet fw4 "$set_v4" { type ipv4_addr\; }
+		nft list set inet fw4 "$set_v6" >/dev/null 2>&1 || nft add set inet fw4 "$set_v6" { type ipv6_addr\; }
+		nft flush set inet fw4 "$set_v4"
+		nft flush set inet fw4 "$set_v6"
+	fi
+}
+
+generate_dnsmasq_entry() {
+	local section="$1"
+	local enable=$(config_n_get "$CONF" "$section" "enable" 0)
+	local enable_domain=$(config_n_get "$CONF" "$section" "enable_domain" 0)
+
+	if [ "$enable" -eq 1 ] && [ "$enable_domain" -eq 1 ]; then
+		local domain_rules=$(config_n_get "$CONF" "$section" "domain_rules")
+		local domains=$(get_domain_list "$domain_rules")
+
+		if [ -n "$domains" ]; then
+			local set_v4="tc_v4_$section"
+			local set_v6="tc_v6_$section"
+			create_sets "$set_v4" "$set_v6"
+
+			if [ -z "$FW4" ]; then
+				local set_str="$set_v4,$set_v6"
+				for d in $domains; do
+					echo "ipset=/$d/$set_str" >> "$DNSMASQ_TMP"
+				done
+			else
+				local set_str="4#inet#fw4#$set_v4,6#inet#fw4#$set_v6"
+				for d in $domains; do
+					echo "nftset=/$d/$set_str" >> "$DNSMASQ_TMP"
+				done
+			fi
+		fi
+	fi
+}
 
 iptables_w() {
 	iptables -w 1 "$@" >/dev/null 2>&1
@@ -294,6 +353,30 @@ cleanup_ipset() {
 Initialize() {
 	logger -t timecontrol ""$1"ing"
 	load_config
+
+	# Prepare DNSMASQ
+	mkdir -p "$(dirname "$DNSMASQ_CONF")"
+	: > "$DNSMASQ_TMP"
+	config_foreach generate_dnsmasq_entry rule
+
+	if [ -f "$DNSMASQ_CONF" ]; then
+		diff "$DNSMASQ_CONF" "$DNSMASQ_TMP" >/dev/null
+		if [ $? -ne 0 ]; then
+			mv "$DNSMASQ_TMP" "$DNSMASQ_CONF"
+			/etc/init.d/dnsmasq reload
+			logger -t timecontrol "reloaded dnsmasq"
+		else
+			rm "$DNSMASQ_TMP"
+		fi
+	else
+		if [ -s "$DNSMASQ_TMP" ]; then
+			mv "$DNSMASQ_TMP" "$DNSMASQ_CONF"
+			/etc/init.d/dnsmasq reload
+			logger -t timecontrol "reloaded dnsmasq"
+		else
+			rm "$DNSMASQ_TMP"
+		fi
+	fi
 
 	if [ -z "$FW4" ]; then
 		set_iptablesChains
